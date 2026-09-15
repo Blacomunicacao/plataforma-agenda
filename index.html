@@ -298,6 +298,29 @@ async function api(action, data = {}) {
   }
 }
 
+// Tenta de novo antes de desistir — pedido do usuário (2026-09-15): "às vezes
+// quando carrega, não aparece as informações do histórico, abre a plataforma
+// como se não tivesse nada lançado". Causa raiz: uma falha TRANSITÓRIA (rede
+// lenta, ou o backend momentaneamente mais devagar por causa do cache de
+// eventos — ver lerAbaCache/Code.gs) fazia `api('getEventos')` lançar uma
+// única vez, e quem chamava trocava silenciosamente pra lista vazia — visto
+// de fora, parece "a agenda está vazia", não "falhou ao carregar uma vez".
+async function apiComRetry(action, data = {}, tentativas = 2) {
+  let ultimoErro;
+  for (let i = 0; i <= tentativas; i++) {
+    try {
+      return await api(action, data);
+    } catch (e) {
+      ultimoErro = e;
+      // Token expirado é falha PERMANENTE (api() já chamou logout() aqui
+      // dentro) — insistir só atrasa a tela de login aparecer de novo.
+      if (e.message && e.message.includes('autorizado')) throw e;
+      if (i < tentativas) await new Promise(r => setTimeout(r, 1200 * (i + 1)));
+    }
+  }
+  throw ultimoErro;
+}
+
 async function apiPost(action, data = {}) {
   try {
     const url = `${API_URL}?action=${encodeURIComponent(action)}&token=${encodeURIComponent(token||'')}`;
@@ -496,15 +519,22 @@ function evtHoje() {
 async function render() {
   if (!token || !usuario) { $('root').innerHTML = htmlLogin(); return; }
   try {
-    eventos = await api('getEventos');
+    eventos = await apiComRetry('getEventos');
     if (!Array.isArray(eventos)) eventos = [];
-  } catch(e) { eventos = []; }
+  } catch(e) {
+    // `api()` já chama logout() (e este, render() de novo) quando o erro é de
+    // token expirado — se o token já sumiu, a tela de login já está no ar,
+    // não sobrescreve ela com a tela de falha genérica.
+    if (!token) return;
+    $('root').innerHTML = htmlFalhaCarregamento(e);
+    return;
+  }
 
   if (usuario.tipo === 'orgao' && isUsuarioSecom()) {
-    try { const r = await api('getEventos', {todos:'true'}); eventos = Array.isArray(r) ? r : []; } catch(e) {}
+    try { const r = await apiComRetry('getEventos', {todos:'true'}); eventos = Array.isArray(r) ? r : []; } catch(e) {}
     todosEventos = [];
   } else if (usuario.tipo === 'orgao' && usuario.orgao !== 'Gabinete do Prefeito') {
-    try { const r = await api('getEventos', {todos:'true'}); todosEventos = Array.isArray(r) ? r : []; } catch(e) { todosEventos = []; }
+    try { const r = await apiComRetry('getEventos', {todos:'true'}); todosEventos = Array.isArray(r) ? r : []; } catch(e) { todosEventos = []; }
   } else {
     todosEventos = [];
   }
@@ -516,6 +546,27 @@ async function render() {
   else                                  $('root').innerHTML = htmlSecretaria();
   inicializarApp();
   iniciarAutoRefresh();
+}
+
+// Tela de falha no carregamento inicial — antes disso, uma falha aqui
+// silenciosamente virava `eventos = []` e o app seguia pro calendário/painel
+// normal como se a agenda genuinamente não tivesse nada lançado (bug real,
+// ver comentário em apiComRetry). Reaproveita o visual da tela de login
+// (mesmas classes CSS) pra deixar claro que é uma FALHA, não "vazio".
+function htmlFalhaCarregamento(erro) {
+  return `
+  <div class="login-page">
+    <div class="login-card">
+      <img src="Logo plataforma de Agenda.png" alt="Agenda" class="login-logo">
+      <h1>Plataforma Agenda</h1>
+      <p style="color:#c0392b;margin:12px 0 4px;font-weight:600">⚠️ Não foi possível carregar a agenda agora</p>
+      <p style="font-size:13px;color:#666;margin-bottom:20px">${(erro && erro.message) || 'Erro desconhecido.'}</p>
+      <button type="button" class="btn-primary" onclick="render()">🔄 Tentar novamente</button>
+      <div class="login-links">
+        <a href="#" onclick="logout();return false">Sair</a>
+      </div>
+    </div>
+  </div>`;
 }
 
 function logout() {
