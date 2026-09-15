@@ -6,11 +6,24 @@
 <title>Agenda - Prefeitura de Presidente Prudente</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.css" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/locales/pt-br.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<!-- `defer` — pedido do usuário (2026-09-15): "no modo mobile estou tendo
+     dificuldade de acessar, esta demorando muito para conectar". Achado
+     real: esses 5 scripts somam ~1,5MB (xlsx.full.min.js sozinho já é
+     861KB) e, sem `defer`, o navegador é OBRIGADO a baixar e executar
+     TUDO isso antes de conseguir desenhar até a tela de LOGIN — que não
+     usa nenhuma dessas bibliotecas. Em rede móvel (3G/4G instável), isso
+     sozinho pode significar vários segundos de tela em branco antes do
+     formulário aparecer. `defer` deixa o HTML renderizar em paralelo ao
+     download, executando os scripts só depois, na mesma ordem relativa,
+     ainda antes do DOMContentLoaded — seguro aqui porque FullCalendar/
+     XLSX/jsPDF só são usados DENTRO de funções (iniciarCalendario,
+     exportarExcel, exportarPDF...), chamadas bem depois do login, nunca
+     no nível superior do script. -->
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/locales/pt-br.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js" defer></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a2a3a;overflow-x:hidden}
@@ -260,7 +273,14 @@ body{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a2a3a;overflow-x:
 <body>
 <div id="root"></div>
 
-<script>
+<!-- `defer` aqui também (não só nos scripts do <head>) — garante que este
+     bloco só rode DEPOIS que FullCalendar/xlsx/jsPDF já terminaram de
+     carregar (scripts com `defer` executam em ordem relativa do
+     documento). Sem isso, um usuário JÁ LOGADO (token salvo, `render()`
+     no fim deste bloco pode ir direto pro calendário) corria risco de
+     `FullCalendar is not defined` numa rede lenta, se a chamada de rede
+     de getEventos terminasse antes do download do script da agenda. -->
+<script defer>
 const API_URL = localStorage.getItem('apiUrl') ||
   'https://script.google.com/macros/s/AKfycbyEMl_w3xkIGcLX-qo589iIf8tZTGMIweVVfsBAYCXvf6UyUgyosCkNUVUI1NSEUuHZ9w/exec';
 
