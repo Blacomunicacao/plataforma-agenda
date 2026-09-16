@@ -656,16 +656,16 @@ function htmlModalSolicitacao() {
       <div class="modal-head"><h3>👤 Solicitar Acesso</h3>
         <button class="modal-close" onclick="fecharModal('modalSolicitacao')">×</button></div>
       <div class="modal-body">
-        <p style="color:#666;font-size:13px;margin-bottom:16px">Preencha os dados. O acesso é liberado imediatamente após o envio.</p>
+        <p style="color:#666;font-size:13px;margin-bottom:16px">Preencha os dados. Um administrador vai revisar e liberar seu acesso — não é imediato.</p>
         <div id="erroSolic" class="erro"></div><div id="okSolic" class="sucesso"></div>
         <form id="formSolic" onsubmit="enviarSolicitacao(event)">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
             <div class="form-group"><label>Nome Completo</label><input id="sNome" type="text" required></div>
-            <div class="form-group"><label>E-mail</label><input id="sEmail" type="email" required></div>
+            <div class="form-group"><label>E-mail (real, será usado pra confirmar sua identidade)</label><input id="sEmail" type="email" required></div>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
             <div class="form-group"><label>Usuário</label><input id="sLogin" type="text" required></div>
-            <div class="form-group"><label>Telefone</label><input id="sTel" type="tel" placeholder="(18) 99999-9999"></div>
+            <div class="form-group"><label>Telefone (obrigatório, pra confirmação)</label><input id="sTel" type="tel" required placeholder="(18) 99999-9999"></div>
           </div>
           <div class="form-group"><label>Órgão / Unidade</label>${orgaosSelectHtml('sOrgao')}</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
@@ -712,11 +712,11 @@ async function enviarSolicitacao(ev) {
   try {
     await api('solicitarAcesso',{
       nome:$('sNome').value, email:$('sEmail').value.trim(),
-      login:$('sLogin').value.trim(), telefone:$('sTel').value,
+      login:$('sLogin').value.trim(), telefone:$('sTel').value.trim(),
       orgao:$('sOrgao').value,
       senha
     });
-    ok.textContent='✅ Conta criada com sucesso! Você já pode fazer login.';
+    ok.textContent='✅ Solicitação enviada! Um administrador vai revisar e liberar seu acesso em breve.';
     ok.style.display='block';
     $('formSolic').reset();
     setTimeout(()=>fecharModal('modalSolicitacao'),3000);
@@ -735,7 +735,7 @@ function htmlModalRecuperarSenha() {
       <div class="modal-head"><h3>🔑 Recuperar Senha</h3>
         <button class="modal-close" onclick="fecharModal('modalRecuperar')">×</button></div>
       <div class="modal-body">
-        <p style="color:#666;font-size:13px;margin-bottom:16px">Informe seu usuário ou e-mail e defina uma nova senha. A alteração é imediata.</p>
+        <p style="color:#666;font-size:13px;margin-bottom:16px">Informe seu usuário ou e-mail e a senha que você quer usar. Um administrador vai confirmar sua identidade antes de liberar — não é imediato.</p>
         <div id="erroRecup" class="erro"></div><div id="okRecup" class="sucesso"></div>
         <form id="formRecup" onsubmit="enviarRecuperar(event)">
           <div class="form-group"><label>Usuário ou E-mail</label>
@@ -774,7 +774,7 @@ async function enviarRecuperar(ev) {
   if(senha.length<4){err.textContent='❌ Senha muito curta (mínimo 4 caracteres).';err.style.display='block';return;}
   try {
     await api('recuperarSenha',{login,novaSenha:senha});
-    ok.textContent='✅ Senha redefinida com sucesso! Você já pode fazer login com a nova senha.';
+    ok.textContent='✅ Pedido enviado! Um administrador vai confirmar sua identidade e liberar a nova senha em breve.';
     ok.style.display='block';
     $('formRecup').reset();
     setTimeout(()=>fecharModal('modalRecuperar'),3000);

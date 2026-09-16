@@ -778,20 +778,47 @@ function handleExcluirUsuario(data) {
   return { success: true, message: 'Usuário excluído' };
 }
 
-// Solicitar Acesso (publico) — criacao de conta automatica, sem aprovacao do admin
+// Garante que a aba 'solicitacoes' exista antes de gravar nela — usado tanto
+// por handleSolicitarAcesso quanto handleRecuperarSenha.
+function getOuCriarSolicitacoesSheet() {
+  var sheet = getSheet('solicitacoes');
+  if (!sheet) {
+    sheet = SpreadsheetApp.openById(SPREADSHEET_ID).insertSheet('solicitacoes');
+    sheet.appendRow(['id','nome','email','login','telefone','orgao','justificativa','status','tipoSolicitacao','data_solicitacao','senha']);
+  }
+  return sheet;
+}
+
+// Solicitar Acesso (publico) — SEMPRE fica PENDENTE ate um admin aprovar
+// (aprovarSolicitacao, index.html, ja chama criarUsuario — devidamente
+// autenticado — na hora da aprovacao).
+//
+// Bug de segurança real corrigido (2026-09-16, usuário: "Invadiram nossa
+// agenda e fizeram o login como cadastro teste"): esta função ANTES criava
+// a conta em 'usuarios' na hora, direto, sem nenhuma aprovação — qualquer
+// pessoa com o link público do sistema (a própria tela de login expõe
+// "Criar Conta") conseguia se auto-cadastrar com QUALQUER nome/e-mail/
+// telefone e ganhar acesso imediato a um órgão real, sem nenhuma
+// verificação de identidade. Agora só grava uma solicitação PENDENTE —
+// o acesso de verdade só existe depois que um admin revisar e aprovar
+// pelo painel (que já chamava `criarUsuario`, só nunca era exercitado
+// porque a conta já existia antes de chegar lá). Telefone virou
+// obrigatório (pedido do usuário: "priorize... o contato telefônico e um
+// email real") — dá ao admin um jeito de confirmar a identidade de quem
+// pediu antes de aprovar.
 function handleSolicitarAcesso(data) {
   const nome = data.nome;
   const email = String(data.email || '').trim();
   const login = String(data.login || '').trim();
-  const telefone = data.telefone;
+  const telefone = String(data.telefone || '').trim();
   const orgao = data.orgao;
   const senha = data.senha;
-  if (!nome || !email || !login || !orgao || !senha) return { error: 'Nome, e-mail, login, orgao e senha sao obrigatorios' };
+  if (!nome || !email || !login || !telefone || !orgao || !senha) {
+    return { error: 'Nome, e-mail, telefone, login, orgao e senha sao obrigatorios' };
+  }
   if (temEspaco(senha)) return { error: 'Espaço não é permitido na senha. Use um caractere especial no lugar.' };
 
-  const aba = lerAba('usuarios');
-  const rows = aba.rows;
-  const sheet = aba.sheet;
+  const rows = lerAba('usuarios').rows;
   if (loginOuEmailEmUso(login, email, rows)) return { error: 'Login ou e-mail já está em uso' };
 
   var count = 0;
@@ -803,53 +830,56 @@ function handleSolicitarAcesso(data) {
     return { error: 'Limite de ' + limite + ' usuários atingido. Entre em contato com a SECOM.' };
   }
 
-  sheet.appendRow([
-    proximoId('usuarios'), login, nome, email, senha,
-    'orgao', orgao, 'FALSE', 'TRUE', new Date().toISOString()
-  ]);
-
-  registrarLog(email, 'criar_conta_autoatendimento', login);
-
-  // Mantem historico em solicitacoes para auditoria (ja aprovado automaticamente)
-  var solicSheet = getSheet('solicitacoes');
-  if (!solicSheet) {
-    solicSheet = SpreadsheetApp.openById(SPREADSHEET_ID).insertSheet('solicitacoes');
-    solicSheet.appendRow(['id','nome','email','login','telefone','orgao','justificativa','status','tipoSolicitacao','data_solicitacao','senha']);
-  }
+  const solicSheet = getOuCriarSolicitacoesSheet();
   solicSheet.appendRow([
     proximoId('solicitacoes'), nome, email, login,
-    telefone || '', orgao, '',
-    'aprovado', 'acesso', new Date().toISOString(), ''
+    telefone, orgao, '',
+    'pendente', 'acesso', new Date().toISOString(), senha
   ]);
 
-  return { success: true, message: 'Conta criada com sucesso' };
+  registrarLog(email, 'solicitar_acesso', login);
+
+  return { success: true, message: 'Solicitação enviada! Um administrador vai revisar e liberar seu acesso em breve.' };
 }
 
-// Recuperar Senha (publico) — reset autônomo
+// Recuperar Senha (publico) — SEMPRE fica PENDENTE ate um admin confirmar
+// (resetarSenhaSolicitacao, index.html, ja chama resetarSenha — devidamente
+// autenticado — na hora da confirmação; o admin define a senha final, não
+// necessariamente a que a pessoa digitou aqui).
+//
+// Bug de segurança real corrigido (2026-09-16, mesma rodada do fix acima):
+// esta função ANTES trocava a senha de QUALQUER conta na hora, só com o
+// login/e-mail (público, fácil de adivinhar/tentar pra logins como
+// "admin"/"educacao"/"saude") — sem enviar nenhum código, sem confirmar
+// e-mail, sem NADA verificando que quem pediu é o dono de verdade da
+// conta. Era um sequestro de conta completo, ao alcance de qualquer
+// visitante do site. Agora só registra um PEDIDO pendente — a senha só
+// muda de verdade depois que um admin confirma a identidade (por telefone/
+// e-mail já cadastrado, fora do sistema) e aprova pelo painel.
 function handleRecuperarSenha(data) {
-  const login = data.login;
+  const login = String(data.login || '').trim();
   const novaSenha = data.novaSenha;
   if (!login) return { error: 'Informe seu login ou e-mail' };
   if (!novaSenha) return { error: 'Informe a nova senha' };
   if (temEspaco(novaSenha)) return { error: 'Espaço não é permitido na senha. Use um caractere especial no lugar.' };
 
-  const aba = lerAba('usuarios');
-  const rows = aba.rows;
-  const headers = aba.headers;
-  const sheet = aba.sheet;
-  var idx = -1;
+  const rows = lerAba('usuarios').rows;
+  var usuario = null;
   for (var i = 0; i < rows.length; i++) {
-    if (rows[i].login === login || rows[i].email === login) { idx = i; break; }
+    if (rows[i].login === login || rows[i].email === login) { usuario = rows[i]; break; }
   }
-  if (idx === -1) return { error: 'Usuário não encontrado. Verifique o login ou contate o administrador.' };
+  if (!usuario) return { error: 'Usuário não encontrado. Verifique o login ou contate o administrador.' };
 
-  const colSenha = headers.indexOf('senha') + 1;
-  if (colSenha < 1) return { error: 'Erro interno: coluna de senha não encontrada.' };
-  sheet.getRange(idx + 2, colSenha).setValue(novaSenha);
+  const solicSheet = getOuCriarSolicitacoesSheet();
+  solicSheet.appendRow([
+    proximoId('solicitacoes'), usuario.nome || '', usuario.email || '', usuario.login,
+    '', usuario.orgao || '', '',
+    'pendente', 'recuperacao', new Date().toISOString(), novaSenha
+  ]);
 
-  registrarLog(rows[idx].email, 'recuperar_senha', 'Senha redefinida via autoatendimento');
+  registrarLog(usuario.email, 'solicitar_recuperacao_senha', 'Pedido registrado, aguardando confirmação do admin');
 
-  return { success: true };
+  return { success: true, message: 'Pedido enviado! Um administrador vai confirmar sua identidade e liberar a nova senha em breve.' };
 }
 
 // Gerenciar Solicitacoes (admin)
