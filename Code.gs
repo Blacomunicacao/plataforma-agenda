@@ -2,7 +2,13 @@
 // GOOGLE APPS SCRIPT - API AGENDA DA PREFEITURA
 // =====================================================
 
-const SPREADSHEET_ID = '1lBUTNecr5eylEn7958UQz8rUFLlHIcFeKcAf0--Jswo';
+// ID da planilha guardado como Script Property (Configurações do projeto no
+// editor do Apps Script → Propriedades do script) — NUNCA em texto puro no
+// código-fonte, que é público no GitHub (achado real, 2026-09-17: usuário
+// perguntou "tem como fazer proteção" pensando num invasor lendo o
+// repositório público; o ID sozinho não abre a planilha — ela já exige
+// login autorizado, confirmei — mas não custa nada tirar ele daqui também).
+const SPREADSHEET_ID = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
 const LIMITE_POR_SESSAO = 5;
 // Excecoes de limite por orgao (demanda maior de usuarios). Demais orgaos usam LIMITE_POR_SESSAO.
 const LIMITES_ESPECIAIS = {
