@@ -538,9 +538,40 @@ function evtHoje() {
 
 async function render() {
   if (!token || !usuario) { $('root').innerHTML = htmlLogin(); return; }
+
+  // Pedido do usuário (2026-09-17): "esta entrando, mas demorando muito".
+  // Painel de Execuções do Apps Script mostrou o backend saudável (1-2,5s
+  // por chamada) — a demora extra vinha daqui: pra SECOM e pra órgão comum,
+  // o app fazia 2 chamadas de rede uma ATRÁS da outra (soma os tempos) em
+  // vez de ao mesmo tempo. Pior ainda pra SECOM: a 1ª chamada (eventos só
+  // do próprio órgão) era buscada e depois DESCARTADA na hora, sem nunca
+  // ser usada — puro desperdício. Corrigido: SECOM pula direto pra chamada
+  // "todos" (só 1 chamada); órgão comum dispara as 2 chamadas que
+  // realmente precisa em PARALELO (Promise.allSettled, não sequencial) —
+  // corta o tempo de espera quase pela metade nos dois casos. Testado
+  // isolado (6 cenários, resultado final idêntico ao código antigo, só
+  // menos/mais rápidas as chamadas de rede).
+  const ehSecom = usuario.tipo === 'orgao' && isUsuarioSecom();
+  const precisaTodos = usuario.tipo === 'orgao' && usuario.orgao !== 'Gabinete do Prefeito' && !ehSecom;
+
   try {
-    eventos = await apiComRetry('getEventos');
-    if (!Array.isArray(eventos)) eventos = [];
+    if (ehSecom) {
+      eventos = await apiComRetry('getEventos', {todos:'true'});
+      if (!Array.isArray(eventos)) eventos = [];
+      todosEventos = [];
+    } else if (precisaTodos) {
+      const [rEventos, rTodos] = await Promise.allSettled([
+        apiComRetry('getEventos'),
+        apiComRetry('getEventos', {todos:'true'}),
+      ]);
+      if (rEventos.status === 'rejected') throw rEventos.reason;
+      eventos = Array.isArray(rEventos.value) ? rEventos.value : [];
+      todosEventos = (rTodos.status === 'fulfilled' && Array.isArray(rTodos.value)) ? rTodos.value : [];
+    } else {
+      eventos = await apiComRetry('getEventos');
+      if (!Array.isArray(eventos)) eventos = [];
+      todosEventos = [];
+    }
   } catch(e) {
     // `api()` já chama logout() (e este, render() de novo) quando o erro é de
     // token expirado — se o token já sumiu, a tela de login já está no ar,
@@ -548,15 +579,6 @@ async function render() {
     if (!token) return;
     $('root').innerHTML = htmlFalhaCarregamento(e);
     return;
-  }
-
-  if (usuario.tipo === 'orgao' && isUsuarioSecom()) {
-    try { const r = await apiComRetry('getEventos', {todos:'true'}); eventos = Array.isArray(r) ? r : []; } catch(e) {}
-    todosEventos = [];
-  } else if (usuario.tipo === 'orgao' && usuario.orgao !== 'Gabinete do Prefeito') {
-    try { const r = await apiComRetry('getEventos', {todos:'true'}); todosEventos = Array.isArray(r) ? r : []; } catch(e) { todosEventos = []; }
-  } else {
-    todosEventos = [];
   }
 
   calendar = null;
