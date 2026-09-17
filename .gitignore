@@ -1,0 +1,5 @@
+# Configuração local do clasp (contém o scriptId do projeto Apps Script) —
+# nunca deve ir pro repositório público. Ver memória/incidente 2026-09-17.
+.clasp.json
+.claspignore
+appsscript.json
