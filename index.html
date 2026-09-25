@@ -281,8 +281,34 @@ body{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a2a3a;overflow-x:
      `FullCalendar is not defined` numa rede lenta, se a chamada de rede
      de getEventos terminasse antes do download do script da agenda. -->
 <script defer>
-const API_URL = localStorage.getItem('apiUrl') ||
-  'https://script.google.com/macros/s/AKfycbyEMl_w3xkIGcLX-qo589iIf8tZTGMIweVVfsBAYCXvf6UyUgyosCkNUVUI1NSEUuHZ9w/exec';
+// URL da API (implantação "Aplicativo da Web" do Apps Script).
+//
+// Trocar o Code.gs exige criar uma NOVA implantação, e a URL antiga continua
+// servindo o código antigo para sempre — ela não é atualizada. Dois detalhes
+// que já custaram tempo:
+//
+// 1. A URL fica AQUI e é o padrão pra quem nunca configurou nada.
+// 2. Quem já clicou em "Configurar URL da API" tem a URL antiga guardada no
+//    navegador. Trocar só o padrão não move essas pessoas: elas ficariam
+//    presas numa implantação que já não recebe as correções, reclamando de
+//    erro que ninguém mais consegue reproduzir. Por isso API_ANTIGAS: a cada
+//    carga, se a URL guardada for uma das antigas, ela é trocada pela atual
+//    sozinha. Ninguém precisa limpar cache nem refazer cadastro.
+//
+// Ao criar uma implantação nova: troque API_ATUAL, garde a anterior em
+// API_ANTIGAS, e publique.
+const API_ATUAL =
+  'https://script.google.com/macros/s/AKfycbx5CNWe4fkf6rKTjqnWVdsvR-UH9KsvqiNpxGKJZQFMAOBNjY3JHIBKhxEJaZRnAuYiXQ/exec';
+const API_ANTIGAS = [
+  'https://script.google.com/macros/s/AKfycbyEMl_w3xkIGcLX-qo589iIf8tZTGMIweVVfsBAYCXvf6UyUgyosCkNUVUI1NSEUuHZ9w/exec'
+];
+(function migraApiUrlSalva() {
+  try {
+    const salva = localStorage.getItem('apiUrl');
+    if (salva && API_ANTIGAS.indexOf(salva) !== -1) localStorage.setItem('apiUrl', API_ATUAL);
+  } catch (e) {}
+})();
+const API_URL = localStorage.getItem('apiUrl') || API_ATUAL;
 
 let token    = localStorage.getItem('token');
 let usuario  = JSON.parse(localStorage.getItem('usuario') || 'null');
