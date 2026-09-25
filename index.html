@@ -308,7 +308,11 @@ async function parseJson(res) {
 async function api(action, data = {}) {
   try {
     const p = new URLSearchParams({ action, token: token || '', ...data });
-    const res = await fetch(`${API_URL}?${p}`);
+    // cache:'no-store' evita que o navegador guarde/reutilize uma resposta ruim (ex: a
+    // pagina de erro HTML que o Apps Script as vezes serve num instante de instabilidade)
+    // pra essa mesma URL — sem isso, um F5 podia repetir o erro indefinidamente mesmo
+    // com o servidor ja saudavel de novo, porque nem chegava a bater na rede.
+    const res = await fetch(`${API_URL}?${p}`, { cache: 'no-store' });
     const json = await parseJson(res);
     if (json && json.error) throw new Error(json.error);
     return json;
@@ -347,7 +351,8 @@ async function apiPost(action, data = {}) {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({ ...data, token: token || '' })
+      body: JSON.stringify({ ...data, token: token || '' }),
+      cache: 'no-store'
     });
     const json = await parseJson(res);
     if (json && json.error) throw new Error(json.error);
