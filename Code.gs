@@ -109,8 +109,31 @@ function getSiglaOrgao(orgao) {
 }
 
 // Helpers
+//
+// Medido em campo (2026-09-25): a API não caía sozinha, mas se punia sozinha.
+// Em repouso, 5 leituras seguidas respondiam em 1,6-4,6s; disparadas em
+// paralelo, 4 de 6 voltaram HTTP 404 e uma requisição trivial e isolada logo
+// depois levou 54s. Causa: cada chamada abria a planilha do ZERO várias vezes
+// e lia abas inteiras sem cache, queimando runtime até encostar na cota
+// diária do Apps Script. openById() é uma ida e volta autenticada ao Sheets —
+// 3 delas por getEventos era 3× o custo da operação inteira.
+//
+// O handle da planilha e o fuso horário NUNCA mudam, então ficam em memória
+// durante a execução. Isso não altera nenhum dado: só elimina trabalho
+// repetido.
+var _ssCache = null;
+function getSS() {
+  if (!_ssCache) _ssCache = SpreadsheetApp.openById(SPREADSHEET_ID);
+  return _ssCache;
+}
+var _tzCache = null;
+function getFusoHorario() {
+  if (!_tzCache) _tzCache = getSS().getSpreadsheetTimeZone();
+  return _tzCache;
+}
+
 function getSheet(nome) {
-  return SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(nome);
+  return getSS().getSheetByName(nome);
 }
 
 function lerAba(nome) {
@@ -236,7 +259,9 @@ function handleLogin(data) {
   if (!usuario || !senha) return { error: 'Usuário e senha são obrigatórios' };
 
   const u = String(usuario).toLowerCase().trim();
-  const rows = lerAba('usuarios').rows;
+  // Login tambem passa pelo cache de 60s: e a chamada mais repetida do sistema
+  // (todo mundo, toda vez que entra) e a aba e pequena.
+  const rows = lerAbaCache('usuarios', 60).rows;
   var user = null;
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
@@ -279,8 +304,12 @@ function handleGetEventos(params) {
   if (!usuario) return { error: 'Não autorizado' };
 
   const eventosRows = lerAbaCache('eventos', 30).rows;
-  const usuariosRows = lerAba('usuarios').rows;
-  const tz = SpreadsheetApp.openById(SPREADSHEET_ID).getSpreadsheetTimeZone();
+  // 'usuarios' também entra em cache (60s, mais generoso que 'eventos' porque
+  // muda pouquíssimo — a lista de usuários muda em minutos, não em segundos).
+  // Antes essa aba era lida INTEIRA da planilha em CADA getEventos, ou seja,
+  // em toda entrada de usuário e em todo auto-refresh de 60s.
+  const usuariosRows = lerAbaCache('usuarios', 60).rows;
+  const tz = getFusoHorario();
 
   var verTodos = params.todos === 'true' || params.todos === true;
   const filtrados = eventosRows.filter(function(e) {
@@ -289,26 +318,45 @@ function handleGetEventos(params) {
     return String(e.orgao || '').trim() === String(usuario.orgao || '').trim();
   });
 
+  // Índice login/e-mail → usuário, montado UMA vez por requisição.
+  // Antes era um laço que varria todos os usuários PARA CADA evento
+  // (O(eventos × usuários)) e normalizava as strings de novo a cada comparação.
+  // Com a agenda grande e o SECOM pedindo 'todos', isso sozinho consumia a cota
+  // do dia. O resultado final é idêntico — só o custo por evento virou O(1).
+  //
+  // Guarda também a POSIÇÃO na planilha porque o laço antigo parava no primeiro
+  // usuário que casasse, na ordem em que aparece. Quando o evento tem login de
+  // um usuário e e-mail de outro (dado inconsistente, mas existe), "primeiro na
+  // ordem" e "e-mail ganha" dão respostas diferentes — então o desempate é pelo
+  // índice menor, que é o que o laço fazia.
+  //
+  // Sem trim() do lado do usuário, de propósito: o laço antigo comparava
+  // String(u.login).toLowerCase() sem aparar, então um usuário com espaço
+  // sobrando simplesmente nunca casava. Preservado aqui para não mudar
+  // comportamento junto com a otimização.
+  var porLogin = {}, porEmail = {};
+  for (var i = 0; i < usuariosRows.length; i++) {
+    var u = usuariosRows[i];
+    var uLogin = String(u.login || '').toLowerCase();
+    var uEmail = String(u.email || '').toLowerCase();
+    if (uLogin && !porLogin[uLogin]) porLogin[uLogin] = { u: u, i: i };
+    if (uEmail && !porEmail[uEmail]) porEmail[uEmail] = { u: u, i: i };
+  }
+
   // Enriquece publicado_por com o login atual (coluna B da aba usuarios)
   return filtrados.map(function(e) {
     const emailRef = String(e.email_publicado || '').trim().toLowerCase();
     const loginRef = String(e.publicado_por  || '').trim().toLowerCase();
-    var pubUser = null;
-    for (var i = 0; i < usuariosRows.length; i++) {
-      var u = usuariosRows[i];
-      const uEmail = String(u.email || '').toLowerCase();
-      const uLogin = String(u.login || '').toLowerCase();
-      if ((emailRef && uEmail === emailRef) || (loginRef && uLogin === loginRef)) {
-        pubUser = u;
-        break;
-      }
-    }
+    var achado = (emailRef && porEmail[emailRef]) || null;
+    var achadoLogin = (loginRef && porLogin[loginRef]) || null;
+    if (achado && achadoLogin) achado = (achado.i <= achadoLogin.i) ? achado : achadoLogin;
+    else if (!achado) achado = achadoLogin;
     var ev = {};
     for (var k in e) { ev[k] = e[k]; }
     ev.data_evento = normalizarDataEvento(e.data_evento, tz);
     ev.sigla_orgao = getSiglaOrgao(e.orgao); // coluna do organograma
-    if (pubUser) {
-      ev.publicado_por = pubUser.login; // coluna B da planilha de usuarios
+    if (achado) {
+      ev.publicado_por = achado.u.login; // coluna B da planilha de usuarios
     }
     return ev;
   });
@@ -389,7 +437,7 @@ function handleCriarEvento(data) {
 
   const sheet = getSheet('eventos');
   if (!sheet) return { error: 'Aba eventos não encontrada' };
-  const tz = SpreadsheetApp.openById(SPREADSHEET_ID).getSpreadsheetTimeZone();
+  const tz = getFusoHorario();
 
   // Define as datas a gerar: uma unica (evento normal) ou varias (recorrencia)
   var datasEvento = [];
@@ -522,7 +570,7 @@ function handleAtualizarRecorrencia(data) {
   const titulo = data.titulo, local = data.local, responsavel = data.responsavel, telefone = data.telefone, observacao = data.observacao;
   if (!titulo || !observacao) return { error: 'Título e observação são obrigatórios' };
 
-  const tz = SpreadsheetApp.openById(SPREADSHEET_ID).getSpreadsheetTimeZone();
+  const tz = getFusoHorario();
   const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
 
   var datasEvento = [];
@@ -634,7 +682,7 @@ function handleExcluirSerieRecorrente(data) {
   const referencia = rows[idxAlvo[0]];
   if (usuario.tipo !== 'admin' && referencia.orgao !== usuario.orgao) return { error: 'Acesso negado' };
 
-  const tz = SpreadsheetApp.openById(SPREADSHEET_ID).getSpreadsheetTimeZone();
+  const tz = getFusoHorario();
   const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
   var idxRemover = idxAlvo.filter(function(i) {
     var dv = String(normalizarDataEvento(rows[i].data_evento, tz) || '').substring(0, 10);
@@ -740,6 +788,12 @@ function handleCriarUsuario(data) {
     tipo === 'prefeito' ? 'TRUE' : 'FALSE',
     'TRUE', new Date().toISOString()
   ]);
+  // handleLogin e handleGetEventos leem 'usuarios' pelo cache de 60s. Sem
+  // invalidar aqui, a conta recem-criada nao entraria por ate 60s — o
+  // usuario clicaria em "Entrar" e receberia "usuario ou senha incorretos"
+  // com uma senha que ele acabou de cadastrar. Isso ja aconteceu antes com
+  // mudanca de senha; agora vale para criacao e exclusao tambem.
+  invalidarCacheAba('usuarios');
 
   registrarLog(admin.email, 'criar_usuario', login);
   return { success: true, message: 'Usuário criado' };
@@ -762,6 +816,7 @@ function handleResetarSenha(data) {
 
   const col = headers.indexOf('senha') + 1;
   sheet.getRange(idx + 2, col).setValue(data.novaSenha);
+  invalidarCacheAba('usuarios');
   registrarLog(admin.email, 'resetar_senha', 'ID: ' + data.usuarioId);
   return { success: true, message: 'Senha alterada' };
 }
@@ -780,6 +835,7 @@ function handleExcluirUsuario(data) {
   if (idx === -1) return { error: 'Usuário não encontrado' };
 
   sheet.deleteRow(idx + 2);
+  invalidarCacheAba('usuarios');
   registrarLog(admin.email, 'excluir_usuario', 'ID: ' + data.id);
   return { success: true, message: 'Usuário excluído' };
 }
@@ -789,7 +845,7 @@ function handleExcluirUsuario(data) {
 function getOuCriarSolicitacoesSheet() {
   var sheet = getSheet('solicitacoes');
   if (!sheet) {
-    sheet = SpreadsheetApp.openById(SPREADSHEET_ID).insertSheet('solicitacoes');
+    sheet = getSS().insertSheet('solicitacoes');
     sheet.appendRow(['id','nome','email','login','telefone','orgao','justificativa','status','tipoSolicitacao','data_solicitacao','senha']);
   }
   return sheet;
@@ -955,13 +1011,14 @@ function handlePrimeiroAdmin(data) {
     1, login, nome || login, email || (login + '@prefeitura.gov.br'),
     senha, 'admin', '', 'FALSE', 'TRUE', new Date().toISOString()
   ]);
+  invalidarCacheAba('usuarios');
 
   return { success: true, message: 'Administrador "' + login + '" criado com sucesso!' };
 }
 
 // Setup inicial das abas
 function criarAbas() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const ss = getSS();
   const config = {
     usuarios:     ['id','login','nome','email','senha','tipo','orgao','is_prefeito','ativo','data_criacao'],
     eventos:      ['id','titulo','data_evento','local','responsavel','telefone','observacao','anexo_url','anexo_nome','orgao','is_prefeito','publicado_por','email_publicado','data_publicacao','data_atualizacao','status','recorrencia_tipo','recorrencia_grupo'],
@@ -1030,7 +1087,7 @@ function autorizarDrive() {
 
 // Testes
 function testarConexao() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const ss = getSS();
   Logger.log('Planilha: ' + ss.getName());
   const abas = ss.getSheets();
   const nomes = [];

@@ -293,6 +293,25 @@ let calendar = null;
 let _autoRefreshId = null;
 let solicitacoesList = [];
 
+// Mensagem única para toda falha de infraestrutura, pro usuário não ver
+// "Unexpected token '<'" nem "Failed to fetch" — que não dizem nada.
+const FALHA_SERVIDOR_MSG = 'Não foi possível se comunicar com o servidor agora. Verifique sua conexão e tente novamente em instantes.';
+
+// Erro que carrega a informação que decide se vale tentar de novo.
+// Medido em campo (2026-09-25): com 6 usuários entrando junto, 4 das 6
+// requisições voltaram HTTP 404 e 1 ficou 45s pendurada até estourar o timeout
+// — o Apps Script Web App não responde de forma confiável quando várias
+// secretarias carregam a página ao mesmo tempo. Isso NÃO é erro do usuário
+// nem erro de senha: é o servidor instável, e nova tentativa resolve.
+class ErroApi extends Error {
+  constructor(mensagem, transitorio, status) {
+    super(mensagem);
+    this.name = 'ErroApi';
+    this.transitorio = transitorio !== false; // padrão: vale tentar de novo
+    this.status = status || 0;
+  }
+}
+
 // O Apps Script às vezes responde com uma página HTML de erro (fora do ar,
 // sobrecarga) em vez do JSON esperado — parseJson troca o "Unexpected token
 // '<'" cru do navegador por uma mensagem clara e acionável em português.
@@ -301,25 +320,39 @@ async function parseJson(res) {
   try {
     return JSON.parse(texto);
   } catch (e) {
-    throw new Error('Não foi possível se comunicar com o servidor agora. Verifique sua conexão e tente novamente em instantes.');
+    throw new ErroApi(FALHA_SERVIDOR_MSG, true, res.status);
   }
 }
 
 async function api(action, data = {}) {
+  let res;
   try {
     const p = new URLSearchParams({ action, token: token || '', ...data });
     // cache:'no-store' evita que o navegador guarde/reutilize uma resposta ruim (ex: a
     // pagina de erro HTML que o Apps Script as vezes serve num instante de instabilidade)
     // pra essa mesma URL — sem isso, um F5 podia repetir o erro indefinidamente mesmo
     // com o servidor ja saudavel de novo, porque nem chegava a bater na rede.
-    const res = await fetch(`${API_URL}?${p}`, { cache: 'no-store' });
-    const json = await parseJson(res);
-    if (json && json.error) throw new Error(json.error);
-    return json;
+    res = await fetch(`${API_URL}?${p}`, { cache: 'no-store' });
   } catch (e) {
-    if (e.message && e.message.includes('autorizado')) logout();
-    throw e;
+    // fetch() só rejeita em falha de rede: offline, DNS, queda de sinal no
+    // celular, CORS barrado. Sempre transitório.
+    throw new ErroApi(FALHA_SERVIDOR_MSG, true, 0);
   }
+
+  // 404/500/502/503: o script não chegou a responder (ver medição acima).
+  // O corpo pode até vir com HTML de erro do Google — em todos os casos a
+  // próxima tentativa é a conduta certa.
+  if (!res.ok) throw new ErroApi(FALHA_SERVIDOR_MSG, true, res.status);
+
+  const json = await parseJson(res);
+  if (json && json.error) {
+    // Resposta VÁLIDA do aplicativo: senha errada, acesso negado, campo
+    // obrigatório. O servidor respondeu bem — repetir não muda o resultado
+    // (e repetir login errado travaria a tela por vários segundos à toa).
+    if (String(json.error).includes('autorizado')) logout();
+    throw new ErroApi(json.error, false, res.status);
+  }
+  return json;
 }
 
 // Tenta de novo antes de desistir — pedido do usuário (2026-09-15): "às vezes
@@ -329,6 +362,18 @@ async function api(action, data = {}) {
 // eventos — ver lerAbaCache/Code.gs) fazia `api('getEventos')` lançar uma
 // única vez, e quem chamava trocava silenciosamente pra lista vazia — visto
 // de fora, parece "a agenda está vazia", não "falhou ao carregar uma vez".
+//
+// Só usar em chamadas de LEITURA (e no login). Nunca envolver escrita
+// (criar/excluir/resetar): se a primeira tentativa gravou na planilha e a
+// resposta se perdeu no caminho, a segunda criaria o mesmo evento duas vezes.
+//
+//tentativas=2 (3 tentativas, ~2,4s no total) e NÃO mais que isso, de propósito:
+// medido em 2026-09-25, a API não cai sozinha — ela SE PUNE quando recebe
+// rajada. Disparar 8 leituras em paralelo deu 0/8 sucesso; logo depois, uma
+// requisição isolada e trivial levou 54s (contra 2,8s em repouso). Ou seja,
+// retry demais durante a punição prolonga a punição e prejudica todo mundo.
+// Duas tentativas extras bastam para atravessar uma falha isolada sem alimentar
+// o problema que estamos tentando evitar.
 async function apiComRetry(action, data = {}, tentativas = 2) {
   let ultimoErro;
   for (let i = 0; i <= tentativas; i++) {
@@ -336,31 +381,47 @@ async function apiComRetry(action, data = {}, tentativas = 2) {
       return await api(action, data);
     } catch (e) {
       ultimoErro = e;
-      // Token expirado é falha PERMANENTE (api() já chamou logout() aqui
-      // dentro) — insistir só atrasa a tela de login aparecer de novo.
+      // Erro definitivo (senha errada, acesso negado, campo obrigatório) ou
+      // sessão expirada — o api() já chamou logout() nesse último caso, e a
+      // tela de login já está no ar. Insistir só atrasa o usuário.
+      if (e.transitorio === false) throw e;
       if (e.message && e.message.includes('autorizado')) throw e;
-      if (i < tentativas) await new Promise(r => setTimeout(r, 1200 * (i + 1)));
+      if (i < tentativas) {
+        // Backoff exponencial (0,8s → 1,6s → 3,2s → 6,4s) COM jitter.
+        // O jitter não é enfeite: sem ele, todos os usuários que caíram na
+        // mesma janela de instabilidade voltam a bater no mesmo milissegundo
+        // e derrubam a API de novo — o problema se reproduz sozinho.
+        const espera = Math.min(800 * Math.pow(2, i), 6400);
+        await new Promise(r => setTimeout(r, espera + Math.random() * 700));
+      }
     }
   }
   throw ultimoErro;
 }
 
+// Escritas (criar/excluir/alterar) NÃO usam apiComRetry de propósito: se a
+// planilha gravar e a resposta se perder no caminho, repetir criaria o mesmo
+// registro duas vezes. Aqui a falha é sempre definitiva e exibida ao usuário.
 async function apiPost(action, data = {}) {
+  let res;
   try {
     const url = `${API_URL}?action=${encodeURIComponent(action)}&token=${encodeURIComponent(token||'')}`;
-    const res = await fetch(url, {
+    res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({ ...data, token: token || '' }),
       cache: 'no-store'
     });
-    const json = await parseJson(res);
-    if (json && json.error) throw new Error(json.error);
-    return json;
   } catch (e) {
-    if (e.message && e.message.includes('autorizado')) logout();
-    throw e;
+    throw new ErroApi(FALHA_SERVIDOR_MSG, true, 0);
   }
+  if (!res.ok) throw new ErroApi(FALHA_SERVIDOR_MSG, true, res.status);
+  const json = await parseJson(res);
+  if (json && json.error) {
+    if (String(json.error).includes('autorizado')) logout();
+    throw new ErroApi(json.error, false, res.status);
+  }
+  return json;
 }
 
 const fmtData = s => s ? new Date(s).toLocaleDateString('pt-BR') : '-';
@@ -541,6 +602,27 @@ function evtHoje() {
   }).sort((a,b) => new Date(a.data_evento)-new Date(b.data_evento));
 }
 
+// Último getEventos que deu certo, guardado por usuário. Rede de segurança
+// para a entrada na plataforma: se a API estiver instável no momento do
+// login, o usuário vê a agenda que já tinha carregado (marcada como
+// desatualizada) em vez de uma tela de erro sem saída. A chave tem o id do
+// usuário para um órgão nunca ver a agenda cacheada de outro.
+function cacheEventosLocal(lista, todos) {
+  try {
+    localStorage.setItem('evtCache:' + (usuario && usuario.id), JSON.stringify({
+      ts: Date.now(), lista: lista, todos: todos
+    }));
+  } catch (e) {}
+}
+function lerEventosLocal() {
+  try {
+    const bruto = localStorage.getItem('evtCache:' + (usuario && usuario.id));
+    if (!bruto) return null;
+    const o = JSON.parse(bruto);
+    return (o && Array.isArray(o.lista)) ? o : null;
+  } catch (e) { return null; }
+}
+
 async function render() {
   if (!token || !usuario) { $('root').innerHTML = htmlLogin(); return; }
 
@@ -577,13 +659,28 @@ async function render() {
       if (!Array.isArray(eventos)) eventos = [];
       todosEventos = [];
     }
+    cacheEventosLocal(eventos, todosEventos);
   } catch(e) {
     // `api()` já chama logout() (e este, render() de novo) quando o erro é de
     // token expirado — se o token já sumiu, a tela de login já está no ar,
     // não sobrescreve ela com a tela de falha genérica.
     if (!token) return;
-    $('root').innerHTML = htmlFalhaCarregamento(e);
-    return;
+
+    // Falha de infraestrutura (404/5xx/rede) E existe uma agenda cacheada
+    // deste usuário: degrada para a cópia local em vez de mostrar tela morta.
+    // Uma agenda levemente antiga é muito melhor do que a plataforma
+    // "aparecer vazia" — que era o sintoma que o usuário relatava.
+    const cache = (e && e.transitorio !== false) ? lerEventosLocal() : null;
+    if (cache) {
+      eventos = cache.lista;
+      todosEventos = Array.isArray(cache.todos) ? cache.todos : [];
+      const quando = new Date(cache.ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+      setTimeout(() => avisar('⚠️ O servidor está instável agora. Mostrando a agenda de ' + quando +
+        ' — clique em "Atualizar" para tentar de novo.'), 400);
+    } else {
+      $('root').innerHTML = htmlFalhaCarregamento(e);
+      return;
+    }
   }
 
   calendar = null;
@@ -661,13 +758,24 @@ function htmlLogin() {
 async function fazerLogin(e) {
   e.preventDefault();
   const err = $('erroLogin'); err.style.display='none';
+  const btn = e.target.querySelector('button[type=submit]');
+  if (btn) btn.disabled = true;
   try {
-    const res = await api('login', { usuario: $('lUser').value.trim(), senha: $('lSenha').value });
+    // Retry com backoff: login era a ÚNICA chamada da tela inicial sem proteção
+    // nenhuma, então um 404 solto do Apps Script (medido em 2026-09-25: 4 de 6
+    // requisições simultâneas vieram com 404) derrubava a entrada do usuário —
+    // era o principal motivo de "no celular não conecta". Senha errada continua
+    // falhando na hora, sem retry, porque a resposta do servidor é definitiva.
+    const res = await apiComRetry('login', { usuario: $('lUser').value.trim(), senha: $('lSenha').value });
     token = res.token; usuario = res.usuario;
     localStorage.setItem('token', token);
     localStorage.setItem('usuario', JSON.stringify(usuario));
     render();
-  } catch(ex) { err.textContent='❌ '+ex.message; err.style.display='block'; }
+  } catch(ex) {
+    err.textContent='❌ '+(ex.message || 'Não foi possível conectar. Tente novamente.');
+    err.style.display='block';
+    if (btn) btn.disabled = false;
+  }
 }
 
 function configurarUrl() {
@@ -999,6 +1107,22 @@ function evtTodosHoje() {
   }).sort((a,b) => new Date(a.data_evento)-new Date(b.data_evento));
 }
 
+// Intervalo do auto-refresh. Era 60s e virou 3min.
+//
+// Medido em 2026-09-25: a API se saturava com rajada (4 de 6 leituras em
+// paralelo vieram com 404) e a unica coisa que sustentava o volume era este
+// timer — uma aba por usuario, um disparo por minuto, sem ninguem olhando
+// (as secretarias deixam abas abertas o dia inteiro). Com 3min o volume cai
+// 3x e continua parecendo atualizado: evento de agenda nao muda a cada minuto.
+const AUTO_REFRESH_MS = 180000;
+// Depois de uma falha, o proximo timer nao bate na API imediatamente — dobra o
+// intervalo a cada falha, ate o teto de 15min. Sem isso, uma API ja saturada
+// recebia mais uma leva de requisicoes justamente enquanto estava ruim.
+let _refreshFalhas = 0;
+function intervaloRefresh() {
+  return Math.min(AUTO_REFRESH_MS * Math.pow(2, _refreshFalhas), 900000);
+}
+
 function iniciarAutoRefresh() {
   if (_autoRefreshId) { clearInterval(_autoRefreshId); _autoRefreshId = null; }
   const tipo = usuario?.tipo;
@@ -1020,21 +1144,23 @@ function iniciarAutoRefresh() {
       window.scrollTo(window.scrollX, scrollY);
       document.body.style.minHeight = '';
     }));
+    let falhou = false;
     try {
       if (isUsuarioSecom()) {
-        try { const r = await api('getEventos',{todos:'true'}); if (Array.isArray(r)) eventos=r; } catch(e) { return; }
+        try { const r = await api('getEventos',{todos:'true'}); if (Array.isArray(r)) { eventos=r; cacheEventosLocal(eventos, todosEventos); } } catch(e) { falhou = true; return; }
         if (calendar) { try { calendar.removeAllEvents(); calendar.addEventSource(eventosParaCalendario()); } catch(e) {} }
         renderizarMetrica();
         return;
       }
-      try { const r = await api('getEventos'); if (Array.isArray(r)) eventos=r; } catch(e) { return; }
+      try { const r = await api('getEventos'); if (Array.isArray(r)) { eventos=r; cacheEventosLocal(eventos, todosEventos); } } catch(e) { falhou = true; return; }
       if (tipo === 'admin') {
         if (calendar) { try { calendar.removeAllEvents(); calendar.addEventSource(eventosParaCalendario()); } catch(e) {} }
         renderizarMetrica();
       } else {
         if (usuario.orgao !== 'Gabinete do Prefeito') {
-          try { const r = await api('getEventos',{todos:'true'}); if (Array.isArray(r)) todosEventos=r; } catch(e) {}
+          try { const r = await api('getEventos',{todos:'true'}); if (Array.isArray(r)) todosEventos=r; } catch(e) { falhou = true; }
         }
+        cacheEventosLocal(eventos, todosEventos);
         const cont1 = $('orgaoEventosHoje');
         if (cont1) { const hj=evtHoje(); cont1.innerHTML=hj.length===0?'<div class="empty">Nenhum evento hoje</div>':hj.map(e=>cardEvento(e)).join(''); }
         const cont2 = $('todosEventosHoje');
@@ -1043,8 +1169,13 @@ function iniciarAutoRefresh() {
       }
     } finally {
       restaurarScroll();
+      // Reagenda com backoff: falhou -> espera o dobro (teto 15min),
+      // deu certo -> volta ao intervalo normal.
+      _refreshFalhas = falhou ? Math.min(_refreshFalhas + 1, 4) : 0;
+      clearInterval(_autoRefreshId);
+      _autoRefreshId = setTimeout(iniciarAutoRefresh, intervaloRefresh());
     }
-  }, 60000);
+  }, AUTO_REFRESH_MS);
 }
 
 // ════════════════ SECOM HTML (leitura de toda a agenda) ════════════════
@@ -1520,7 +1651,7 @@ function calcularDadosExportacao(usuariosPorOrgao) {
 
 async function buscarContagemUsuariosParaExport() {
   if (usuario?.tipo !== 'admin' && !isUsuarioSecom()) return {};
-  try { return await api('getContagemUsuarios'); } catch (e) { return {}; }
+  try { return await apiComRetry('getContagemUsuarios', {}, 2); } catch (e) { return {}; }
 }
 
 function renderizarMetrica() {
@@ -2020,7 +2151,16 @@ async function criarEvento(ev) {
 }
 
 async function recarregarEventos() {
-  try { const r=await api('getEventos'); if(Array.isArray(r)) eventos=r; } catch(e){}
+  // Botão "Atualizar" é uma ação deliberada do usuário: aqui vale insistir mais
+  // que no auto-refresh silencioso. Em caso de falha, mantém a lista na tela e
+  // explica o motivo — limpar a agenda por causa de um 404 momentâneo é
+  // exatamente o que fez o usuário achar que tudo tinha sumido.
+  try {
+    const r = await apiComRetry('getEventos');
+    if (Array.isArray(r)) { eventos = r; cacheEventosLocal(eventos, todosEventos); }
+  } catch(e) {
+    alert('⚠️ ' + ((e && e.message) || 'Não foi possível atualizar agora. A agenda exibida é a última carregada.'));
+  }
   const cont=$('listaEvtConteudo');
   if(cont){
     if(usuario?.tipo==='admin') cont.innerHTML=renderTabelaAdmin(eventos);
@@ -2412,7 +2552,7 @@ async function exportarPDF() {
 async function carregarUsuarios() {
   const cont=$('listaUsuarios'); if(!cont) return;
   try {
-    const lista=await api('getUsuarios');
+    const lista=await apiComRetry('getUsuarios');
     if(!Array.isArray(lista)){cont.innerHTML='<div class="empty">Erro ao carregar</div>';return;}
     const tipoLabel={admin:'Administrador',prefeito:'Prefeito',orgao:'Órgão'};
     cont.innerHTML=`<div class="tabela-wrap"><table>
@@ -2467,7 +2607,7 @@ async function excluirUsuario(id, nome) {
 async function carregarSolicitacoes() {
   const cont=$('listaSolicitacoes'); if(!cont) return;
   try {
-    const lista=await api('getSolicitacoes');
+    const lista=await apiComRetry('getSolicitacoes');
     solicitacoesList=Array.isArray(lista)?lista:[];
     const pendentes=solicitacoesList.filter(s=>s.status==='pendente');
     const badge=$('badgeSolic');
@@ -2536,7 +2676,7 @@ async function aprovarSolicitacao(id) {
 async function resetarSenhaSolicitacao(id, login) {
   const nova=prompt(`Nova senha para "${login}":`); if(!nova) return;
   try {
-    const lista=await api('getUsuarios');
+    const lista=await apiComRetry('getUsuarios');
     const user=lista.find(u=>u.login===login||u.email===login);
     if(!user){alert('Usuário não encontrado na base.');return;}
     await api('resetarSenha',{usuarioId:user.id,novaSenha:nova});
