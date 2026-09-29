@@ -268,6 +268,22 @@ body{font-family:'Inter',sans-serif;background:#f0f2f5;color:#1a2a3a;overflow-x:
   .secao-header h2{font-size:16px}
 }
 @media(max-width:360px){.stats-grid{grid-template-columns:1fr}}
+
+/* Tela de espera — some a lentidão do Apps Script (medido em 2026-09-29: o
+   login responde em 1,4s a 9,4s, média 3,2s, e a carga dos eventos soma mais
+   2-3s). Antes o botão só desabilitava em silêncio: 10 segundos de tela
+   parada pareciam sistema travado, não servidor lento. Aqui a espera é
+   nomeada, e o usuário sabe o que está acontecendo. */
+#telaEspera{position:fixed;inset:0;z-index:9999;background:rgba(255,255,255,.97);
+  display:none;align-items:center;justify-content:center;padding:24px}
+#telaEspera.on{display:flex}
+#telaEspera .espera-caixa{display:flex;flex-direction:column;align-items:center;gap:18px;
+  max-width:320px;text-align:center}
+#telaEspera .spinner{width:42px;height:42px;border:3px solid #e3e6ea;border-top-color:#2a6df4;
+  border-radius:50%;animation:gira .8s linear infinite}
+#telaEspera .espera-titulo{font-size:16px;font-weight:600;color:#333}
+#telaEspera .espera-msg{font-size:13px;color:#777;line-height:1.5}
+@keyframes gira{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -650,7 +666,7 @@ function lerEventosLocal() {
 }
 
 async function render() {
-  if (!token || !usuario) { $('root').innerHTML = htmlLogin(); return; }
+  if (!token || !usuario) { $('root').innerHTML = htmlLogin(); esconderEspera(); return; }
 
   // Pedido do usuário (2026-09-17): "esta entrando, mas demorando muito".
   // Painel de Execuções do Apps Script mostrou o backend saudável (1-2,5s
@@ -705,6 +721,7 @@ async function render() {
         ' — clique em "Atualizar" para tentar de novo.'), 400);
     } else {
       $('root').innerHTML = htmlFalhaCarregamento(e);
+      esconderEspera();
       return;
     }
   }
@@ -716,6 +733,10 @@ async function render() {
   else                                  $('root').innerHTML = htmlSecretaria();
   inicializarApp();
   iniciarAutoRefresh();
+  // Só agora a tela real existe — antes deste ponto o overlay é o que o
+  // usuário vê durante a carga da agenda, inclusive na entrada com sessão
+  // já salva (sem isso, abrir o site com token guardado ficava em branco).
+  esconderEspera();
 }
 
 // Tela de falha no carregamento inicial — antes disso, uma falha aqui
@@ -747,6 +768,27 @@ function logout() {
 }
 
 // ════════════════ LOGIN ════════════════
+// Tela de espera durante login e carga da agenda. Ver comentário do CSS para
+// por que isso existe: a API responde em segundos, e silêncio nesse intervalo
+// é indistinguível de travamento.
+function mostrarEspera(msg) {
+  let el = document.getElementById('telaEspera');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'telaEspera';
+    el.innerHTML = '<div class="espera-caixa"><div class="spinner"></div>' +
+                   '<div class="espera-titulo">Plataforma Agenda</div>' +
+                   '<div class="espera-msg"></div></div>';
+    document.body.appendChild(el);
+  }
+  el.querySelector('.espera-msg').textContent = msg || '';
+  el.classList.add('on');
+}
+function esconderEspera() {
+  const el = document.getElementById('telaEspera');
+  if (el) el.classList.remove('on');
+}
+
 function htmlLogin() {
   return `
   <div class="login-page">
@@ -785,7 +827,9 @@ async function fazerLogin(e) {
   e.preventDefault();
   const err = $('erroLogin'); err.style.display='none';
   const btn = e.target.querySelector('button[type=submit]');
-  if (btn) btn.disabled = true;
+  const rotuloOriginal = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Verificando…'; }
+  mostrarEspera('Verificando seu usuário e senha…');
   try {
     // Retry com backoff: login era a ÚNICA chamada da tela inicial sem proteção
     // nenhuma, então um 404 solto do Apps Script (medido em 2026-09-25: 4 de 6
@@ -796,11 +840,23 @@ async function fazerLogin(e) {
     token = res.token; usuario = res.usuario;
     localStorage.setItem('token', token);
     localStorage.setItem('usuario', JSON.stringify(usuario));
-    render();
+    // Troca a mensagem em vez de esconder: a entrada deu certo, mas os eventos
+    // ainda estão vindo. Sem isto o spinner some e o usuário fica olhando o
+    // formulário de login por mais alguns segundos sem explicação.
+    mostrarEspera('Tudo certo! Carregando a agenda…');
+// Abertura com sessão já salva: o render() dispara a busca dos eventos
+// (~1,5-4s na API atual) e, sem o overlay, o usuário ficava olhando uma página
+// em branco sem nenhuma indicação de que algo estava carregando. Só entra
+// na espera quando existe mesmo sessão — com token inválido, o render()
+// detecta e cai na tela de login, e mostrar "carregando" aí seria mentira.
+if (token && usuario) mostrarEspera('Carregando sua agenda…');
+
+render();
   } catch(ex) {
+    esconderEspera();
+    if (btn) { btn.disabled = false; btn.innerHTML = rotuloOriginal; }
     err.textContent='❌ '+(ex.message || 'Não foi possível conectar. Tente novamente.');
     err.style.display='block';
-    if (btn) btn.disabled = false;
   }
 }
 
