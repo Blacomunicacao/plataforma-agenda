@@ -1205,15 +1205,60 @@ function intervaloRefresh() {
   return Math.min(AUTO_REFRESH_MS * Math.pow(2, _refreshFalhas), 900000);
 }
 
+// Redesenha a tela inteira com os dados atuais. As listas e os números do
+// painel são montados uma vez só, no htmlXxx() do render() — sem isto, o
+// auto-refresh atualizava só o calendário e os cards de "hoje", e quem deixa a
+// aba aberta o dia todo ficava com a lista e o painel da hora do login.
+// Não redesenha (fica para o próximo ciclo) se houver modal aberto ou alguém
+// digitando, nem no calendário (ele já é atualizado no lugar, sem perder o mês).
+function redesenharTela() {
+  if (!usuario || document.querySelector('.modal-bg.aberto')) return;
+  const foco = document.activeElement;
+  if (foco && /^(INPUT|TEXTAREA|SELECT)$/.test(foco.tagName)) return;
+  const view = document.querySelector('.view.active')?.id;
+  if (view === 'calendario') return;
+  const busca = $('buscaEvt')?.value || '';
+  const scrollY = window.scrollY;
+  calendar = null;
+  if      (usuario.tipo === 'admin')    $('root').innerHTML = htmlAdmin();
+  else if (usuario.tipo === 'prefeito') $('root').innerHTML = htmlPrefeito();
+  else if (isUsuarioSecom())            $('root').innerHTML = htmlSecom();
+  else                                  $('root').innerHTML = htmlSecretaria();
+  inicializarApp();
+  if (view) mostrarView(view);
+  if (busca && $('buscaEvt')) {
+    $('buscaEvt').value = busca;
+    if (usuario.tipo === 'prefeito') filtrarEventosPref(); else filtrarEventos();
+  }
+  window.scrollTo(window.scrollX, scrollY);
+}
+
+// Voltar para a aba (estava minimizada/em outra janela) atualiza na hora, em
+// vez de esperar o próximo ciclo — enquanto escondida ela não atualiza.
+let _ultimoRefresh = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && token && usuario && Date.now() - _ultimoRefresh > 60000) {
+    if (_autoRefreshId) { clearTimeout(_autoRefreshId); _autoRefreshId = null; }
+    cicloAutoRefresh();
+  }
+});
+
 function iniciarAutoRefresh() {
-  if (_autoRefreshId) { clearInterval(_autoRefreshId); _autoRefreshId = null; }
+  if (_autoRefreshId) { clearTimeout(_autoRefreshId); _autoRefreshId = null; }
   const tipo = usuario?.tipo;
-  if (tipo !== 'admin' && tipo !== 'orgao') return;
-  _autoRefreshId = setInterval(async function() {
+  if (tipo !== 'admin' && tipo !== 'orgao' && tipo !== 'prefeito') return;
+  _autoRefreshId = setTimeout(cicloAutoRefresh, intervaloRefresh());
+}
+
+async function cicloAutoRefresh() {
+  const tipo = usuario?.tipo;
+  if (!token || (tipo !== 'admin' && tipo !== 'orgao' && tipo !== 'prefeito')) return;
+  {
     // Aba em segundo plano (minimizada/outra janela em foco) não precisa de dado
     // fresco — pular evita bater na API sem ninguém olhando (multiplicado por
     // quantas abas as secretarias costumam deixar esquecidas abertas o dia todo).
-    if (document.hidden) return;
+    if (document.hidden) { iniciarAutoRefresh(); return; }
+    _ultimoRefresh = Date.now();
     // Com height:'auto' o FullCalendar encolhe ao remover eventos e cresce de novo ao
     // adicionar — nesse intervalo a página fica mais baixa que o scroll atual e o
     // navegador "clampa" a rolagem pro topo. Travar a altura mínima da página ANTES
@@ -1232,14 +1277,16 @@ function iniciarAutoRefresh() {
         try { const r = await api('getEventos',{todos:'true'}); if (Array.isArray(r)) { eventos=r; cacheEventosLocal(eventos, todosEventos); } } catch(e) { falhou = true; return; }
         if (calendar) { try { calendar.removeAllEvents(); calendar.addEventSource(eventosParaCalendario()); } catch(e) {} }
         renderizarMetrica();
+        redesenharTela();
         return;
       }
       try { const r = await api('getEventos'); if (Array.isArray(r)) { eventos=r; cacheEventosLocal(eventos, todosEventos); } } catch(e) { falhou = true; return; }
       if (tipo === 'admin') {
         if (calendar) { try { calendar.removeAllEvents(); calendar.addEventSource(eventosParaCalendario()); } catch(e) {} }
         renderizarMetrica();
+        redesenharTela();
       } else {
-        if (usuario.orgao !== 'Gabinete do Prefeito') {
+        if (tipo === 'orgao' && usuario.orgao !== 'Gabinete do Prefeito') {
           try { const r = await api('getEventos',{todos:'true'}); if (Array.isArray(r)) todosEventos=r; } catch(e) { falhou = true; }
         }
         cacheEventosLocal(eventos, todosEventos);
@@ -1248,16 +1295,18 @@ function iniciarAutoRefresh() {
         const cont2 = $('todosEventosHoje');
         if (cont2) { const todos=evtTodosHoje(); cont2.innerHTML=todos.length===0?'<div class="empty">Nenhum evento hoje</div>':todos.map(e=>cardEventoResumo(e)).join(''); }
         if (calendar) { try { calendar.removeAllEvents(); calendar.addEventSource(eventosParaCalendario()); } catch(e) {} }
+        redesenharTela();
       }
     } finally {
       restaurarScroll();
       // Reagenda com backoff: falhou -> espera o dobro (teto 15min),
-      // deu certo -> volta ao intervalo normal.
+      // deu certo -> volta ao intervalo normal. Um único setTimeout: antes o
+      // finally agendava iniciarAutoRefresh, que abria um setInterval novo, e
+      // o ciclo real virava 6 min em vez de 3.
       _refreshFalhas = falhou ? Math.min(_refreshFalhas + 1, 4) : 0;
-      clearInterval(_autoRefreshId);
-      _autoRefreshId = setTimeout(iniciarAutoRefresh, intervaloRefresh());
+      iniciarAutoRefresh();
     }
-  }, AUTO_REFRESH_MS);
+  }
 }
 
 // ════════════════ SECOM HTML (leitura de toda a agenda) ════════════════
