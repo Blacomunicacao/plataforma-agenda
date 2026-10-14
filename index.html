@@ -2237,8 +2237,11 @@ async function recarregarEventos() {
   // que no auto-refresh silencioso. Em caso de falha, mantém a lista na tela e
   // explica o motivo — limpar a agenda por causa de um 404 momentâneo é
   // exatamente o que fez o usuário achar que tudo tinha sumido.
+  // SECOM vê a agenda inteira: sem {todos:'true'} o backend devolve só os
+  // eventos da própria SECOM, e a lista dela encolhia depois de cada
+  // salvar/editar/excluir/Atualizar (até o auto-refresh de 60s restaurar).
   try {
-    const r = await apiComRetry('getEventos');
+    const r = await apiComRetry('getEventos', isUsuarioSecom() ? {todos:'true'} : {});
     if (Array.isArray(r)) { eventos = r; cacheEventosLocal(eventos, todosEventos); }
   } catch(e) {
     alert('⚠️ ' + ((e && e.message) || 'Não foi possível atualizar agora. A agenda exibida é a última carregada.'));
